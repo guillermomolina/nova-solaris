@@ -83,10 +83,10 @@ from nova.virt import hardware
 from nova.virt import images
 
 from nova_solaris.solariszones import sysconfig
+from nova_solaris.solariszones.config import CONF
 from nova_solaris.solariszones.volume_api import SolarisVolumeAPI
 
 LOG = logging.getLogger(__name__)
-CONF = cfg.CONF
 
 # These should match the strings returned by the zone_state_str()
 # function in the (private) libzonecfg library. These values are in turn

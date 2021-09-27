@@ -18,14 +18,21 @@
 
 from oslo_config import cfg
 
+from nova_solaris.common.i18n import _
+
 CONF = cfg.CONF
 
-solariszones_group = cfg.OptGroup(
-    'solariszones',
-    title='Solaris Zones Options')
 
+SOLARISZONES_GROUP_NAME = 'solariszones'
+DEFAULT_INTERFACE_MAPPINGS = []
 
-solariszones_opts = [
+SOLARISZONES_GROUP = cfg.OptGroup(
+    SOLARISZONES_GROUP_NAME,
+    title='Solaris Zones Options',
+    help=('Configuration options for the nova-solariszones driver.')
+)
+
+SOLARISZONES_OPTS = [
     cfg.StrOpt('boot_volume_type',
                default=None,
                help='Cinder volume type to use for boot volumes'),
@@ -59,17 +66,20 @@ solariszones_opts = [
                      'metadata.'),
 ]
 
-def register_opts(conf):
-    conf.register_group(solariszones_group)
-    conf.register_opts(solariszones_opts, group=solariszones_group)
 
-# To generate a sample config run:
-# $ oslo-config-generator --namespace nova_solariszones > nova_solariszones_sample.conf
+ALL_OPTS = [
+    (SOLARISZONES_GROUP, SOLARISZONES_OPTS)
+]
+
+
+def register_opts():
+    for group, opts in ALL_OPTS:
+        CONF.register_group(group)
+        CONF.register_opts(opts, group=group)
+
+
 def list_opts():
-    # The nova conf tooling expects each module to return a dict of options.
-    # When solariszones is pulled into nova proper the return value would be in
-    # this form:
-    # return {solariszones_group.name: solariszones_opts}
-    #
-    # The oslo-config-generator tooling expects a tuple:
-    return [(solariszones_group.name, solariszones_opts)]
+    return ALL_OPTS
+
+
+register_opts()
