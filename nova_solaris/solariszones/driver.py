@@ -4024,7 +4024,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             free_disk_gb = 0
         host_stats['local_gb_used'] = host_stats['local_gb'] - free_disk_gb
 
-        host_stats['hypervisor_type'] = fields.HVType.SOL
+        host_stats['hypervisor_type'] = fields.HVType.SOLARISZONES
         host_stats['hypervisor_version'] = \
             versionutils.convert_version_to_int(HYPERVISOR_VERSION)
         host_stats['hypervisor_hostname'] = self._uname[1]
@@ -4040,7 +4040,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         host_stats['disk_available_least'] = free_disk_gb
         host_stats['supported_instances'] = [
-            (architecture, fields.HVType.SOL, fields.VMMode.HVM)
+            (architecture, fields.HVType.SOLARISZONES, fields.VMMode.SOL)
         ]
         host_stats['numa_topology'] = None
 
