@@ -7,4 +7,5 @@ oslo.utils>=4.8.0 # Apache-2.0
 oslo.config>=6.8.0 # Apache-2.0
 oslo.concurrency>=4.4.0 # Apache-2.0
 oslo.i18n>=5.0.1 # Apache-2.0
-nova>=21.0.0 # Apache-2.0
+nova>=23.0.0 # Apache-2.0
+passlib # BSD

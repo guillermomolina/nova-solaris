@@ -16,4 +16,4 @@ import pbr.version
 
 
 __version__ = pbr.version.VersionInfo(
-    'nova-solaris-zones').version_string()
+    'nova-solaris').version_string()
