@@ -3008,7 +3008,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
                     zc.removeresources("device", resource_scope)
                 raise
 
-    def detach_volume(self, connection_info, instance, mountpoint,
+    def detach_volume(self, context, connection_info, instance, mountpoint,
                       encryption=None):
         LOG.debug("detach_volume")
         """Detach the disk attached to the instance."""
