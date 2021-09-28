@@ -52,8 +52,6 @@ from oslo_utils import strutils
 from oslo_utils import versionutils
 from passlib.hash import sha256_crypt
 
-from os_brick.initiator import connector
-
 from nova import conf as cfg
 from nova.api.metadata import base as instance_metadata
 from nova.api.metadata import password
@@ -4856,8 +4854,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
         """Undo for Resource Pools."""
         raise NotImplementedError()
 
+
     def get_volume_connector(self, instance):
-        LOG.debug("get_volume_connector")
         """Get connector information for the instance for attaching to volumes.
 
         Connector information is a dictionary representing the ip of the
@@ -4874,12 +4872,37 @@ class SolarisZonesDriver(driver.ComputeDriver):
             }
 
         """
-        root_helper = utils.get_root_helper()
-        return connector.get_connector_properties(
-            root_helper, CONF.my_block_storage_ip,
-            CONF.libvirt.volume_use_multipath,
-            enforce_multipath=True,
-            host=CONF.host)
+        connector = {
+            'ip': self.get_host_ip_addr(),
+            'host': CONF.host
+        }
+        if not self._initiator:
+            self._initiator = self._get_iscsi_initiator()
+
+        if self._initiator:
+            connector['initiator'] = self._initiator
+        else:
+            LOG.debug(_("Could not determine iSCSI initiator name"),
+                      instance=instance)
+
+        if not self._fc_wwnns:
+            self._fc_wwnns = self._get_fc_wwnns()
+            if not self._fc_wwnns or len(self._fc_wwnns) == 0:
+                LOG.debug(_('Could not determine Fibre Channel '
+                          'World Wide Node Names'),
+                          instance=instance)
+
+        if not self._fc_wwpns:
+            self._fc_wwpns = self._get_fc_wwpns()
+            if not self._fc_wwpns or len(self._fc_wwpns) == 0:
+                LOG.debug(_('Could not determine Fibre Channel '
+                          'World Wide Port Names'),
+                          instance=instance)
+
+        if self._fc_wwnns and self._fc_wwpns:
+            connector["wwnns"] = self._fc_wwnns
+            connector["wwpns"] = self._fc_wwpns
+        return connector
 
     def get_available_nodes(self, refresh=False):
         LOG.debug("get_available_nodes %s", str(refresh))
