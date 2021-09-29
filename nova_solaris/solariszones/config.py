@@ -1,7 +1,5 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-# Copyright (c) 2019, Guillermo Adrian Molina. All rights reserved.
-#
+# Copyright 2021, Guillermo Adrian Molina.
+# Copyright 2021, Guillermo Adrian Molina.
 # Copyright (c) 2013, Oracle and/or its affiliates. All rights reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
