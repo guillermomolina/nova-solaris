@@ -1,7 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2019, Guillermo Adrian Molina. All rights reserved.
-#
+# Copyright 2021, Guillermo Adrian Molina.
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
 #
@@ -35,9 +34,10 @@ from collections import defaultdict
 import rad.bindings.com.oracle.solaris.rad.archivemgr_1 as archivemgr
 import rad.bindings.com.oracle.solaris.rad.kstat_2 as kstat
 import rad.bindings.com.oracle.solaris.rad.zonemgr_1 as zonemgr
+import rad.bindings.com.oracle.solaris.rad.zfsmgr_1 as zfsmgr
+import rad.bindings.com.oracle.solaris.rad.bemgr_1 as bemgr
 import rad.client
 import rad.connect
-from solaris_install.target.size import Size
 
 from eventlet import greenthread
 from lxml import etree
@@ -391,6 +391,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
     def __init__(self, virtapi):
         LOG.debug("__init__")
         self.virtapi = virtapi
+        self._be_manager = None
         self._archive_manager = None
         self._compute_event_callback = None
         self._conductor_api = conductor.API()
@@ -460,6 +461,19 @@ class SolarisZonesDriver(driver.ComputeDriver):
             raise exception.NovaException(reason)
 
         return self._archive_manager
+
+    @property
+    def be_manager(self):
+        try:
+            if (self._be_manager is None or
+                    self._be_manager._conn._closed is not None):
+                self._be_manager = self.rad_connection.get_object(
+                    bemgr.BEManager())
+        except Exception as ex:
+            reason = _("Unable to obtain RAD object: %s") % ex
+            raise exception.NovaException(reason)
+
+        return self._be_manager
 
     def plug_vifs(self, instance, network_info):
         if network_info:
@@ -587,6 +601,33 @@ class SolarisZonesDriver(driver.ComputeDriver):
         except Exception:
             raise
         return zone
+
+    def _get_zpool_by_name(self, name):
+        """Return a Solaris Zpool object via RAD by name."""
+        try:
+            zpool = self.rad_connection.get_object(
+                zfsmgr.Zpool(), rad.client.ADRGlobPattern({'name': name}))
+        except rad.client.NotFoundError:
+            return None
+        except Exception:
+            raise
+        return zpool
+
+    def _get_root_zpool(self):
+        """Return the Zpool object used by the active boot environment."""
+        LOG.debug('Get root zpool from the active boot environment')
+        try:
+            be = self.be_manager.getActiveBE()
+        except Exception as ex:
+            if isinstance(ex, rad.client.ObjectError):
+                reason = ex.get_payload().info
+            else:
+                reason = str(ex)
+            LOG.exception('Could not get root zpool from the active boot environment')
+            return None
+        
+        LOG.debug('The active boot environment is %s', be.name)
+        return self._get_zpool_by_name(be.zpool)
 
     def _get_state(self, zone):
         """Return the running state, one of the power_state codes."""
@@ -1055,11 +1096,13 @@ class SolarisZonesDriver(driver.ComputeDriver):
 #            instance['instance_type_id'])
         return instance.flavor
 
-    def _fetch_image(self, context, instance):
+    def _fetch_image(self, context, instance, image_meta):
         """Fetch an image using Glance given the instance's image_ref."""
+        LOG.debug('Fetch image', image_meta)
         glancecache_dirname = CONF.solariszones.glancecache_dirname
         fileutils.ensure_tree(glancecache_dirname)
         iref = instance['image_ref']
+        LOG.debug('Downloading image %s' % iref)
         image = os.path.join(glancecache_dirname, iref)
         downloading = image + '.downloading'
 
@@ -1086,6 +1129,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
     @lockutils.synchronized('validate_image')
     def _validate_image(self, context, image, instance):
+        LOG.debug('Validate image %s' % image)
         """Validate a glance image for compatibility with the instance."""
         # Skip if the image was already checked and confirmed as valid.
         if instance['image_ref'] in self._validated_archives:
@@ -1145,10 +1189,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         if brand == ZONE_BRAND_SOLARIS_KZ:
             # verify the memory is 256mb aligned
-            test_size = Size('256MB')
-            instance_size = Size('%sMB' % instance['memory_mb'])
-
-            if instance_size.byte_value % test_size.byte_value:
+            MEMORY_ALIGNMENT_IN_MB = 256
+            if instance['memory_mb'] % MEMORY_ALIGNMENT_IN_MB:
                 # non-zero result so it doesn't align
                 raise MemoryAlignmentIncorrect(
                     flavor=flavor['name'],
@@ -2284,7 +2326,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None, power_on=True, accel_info=None):
-        LOG.debug("spawn(network_info=%s)", str(network_info))
+        LOG.info("Spawning new instance named ", instance.name)
 
         """Create a new instance/VM/domain on the virtualization platform.
 
@@ -2310,7 +2352,9 @@ class SolarisZonesDriver(driver.ComputeDriver):
         :param block_device_info: Information about block devices to be
                                   attached to the instance.
         """
-        image = self._fetch_image(context, instance)
+        LOG.debug('XXXXXXXXXXXXXXXXXXXXX', instance, image_meta)
+
+        image = self._fetch_image(context, instance, image_meta)
         self._validate_image(context, image, instance)
         self._validate_flavor(instance)
 
@@ -3960,17 +4004,30 @@ class SolarisZonesDriver(driver.ComputeDriver):
         """
         raise NotImplementedError()
 
-    def _get_zpool_property(self, prop, zpool):
-        """Get the value of property from the zpool."""
+    def _get_zpool_property(self, prop, zpool, integer_val=True):
+        """Get the value of properties from the zpool."""
+        value = None
         try:
-            value = None
-            (out, _err) = processutils.execute(
-                '/usr/sbin/zpool', 'get', prop, zpool)
-        except processutils.ProcessExecutionError as ex:
-            reason = ex.stderr
-            LOG.exception(_("Failed to get property '%s' from zpool '%s': %s")
-                          % (prop, zpool, reason))
-            return value
+            prop_req = zfsmgr.ZfsPropRequest(name=prop, integer_val=integer_val)
+            pvalues = zpool.get_props([prop_req])
+            if pvalues is None or len(pvalues) != 1:
+                raise Exception('rad get_props failed')
+            if pvalues[0].error is not None:
+                raise Exception(pvalues[0].error)
+            value = pvalues[0].value
+            if integer_val:
+                value = int(value)
+        except Exception as ex:
+            if isinstance(ex, rad.client.ObjectError):
+                reason = ex.get_payload().info
+            else:
+                reason = str(ex)
+            LOG.exception(_("Failed to get property '%s' from zpool: %s")
+                          % (prop, reason))
+            return None
+
+        LOG.debug('Zpool property %s: %s' % (prop, str(value)))
+        return value
 
         zpool_prop = out.splitlines()[1].split()
         if zpool_prop[1] == prop:
@@ -3983,17 +4040,37 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         host_stats['vcpus'] = os.sysconf('SC_NPROCESSORS_ONLN')
 
-        pages = os.sysconf('SC_PHYS_PAGES')
-        host_stats['memory_mb'] = self._pages_to_kb(pages) / 1024
+        total_pages = os.sysconf('SC_PHYS_PAGES')
+        host_stats['memory_mb'] = int(self._pages_to_kb(total_pages) / 1024)
 
-        out, err = processutils.execute(
-            '/usr/sbin/zfs', 'list', '-Ho', 'name', '/')
-        root_zpool = out.split('/')[0]
+        # Subtract the number of free pages from the total to get the used.
+        uri = "kstat:/pages/unix/system_pages"
+        data = self._kstat_data(uri)
+        if data is not None:
+            free_pages = data['pagesfree']
+            used_pages = total_pages - free_pages
+            used_ram_kb = self._pages_to_kb(used_pages)
+            host_stats['memory_mb_used'] = int(used_ram_kb / 1024)
+            LOG.debug('total_pages: %d, free_pages: %d, used_pages: %d, used_ram_kb: %d, memory_mb_used: %d' %
+                (total_pages, free_pages, used_pages, used_ram_kb, host_stats['memory_mb_used']))
+        else:
+            host_stats['memory_mb_used'] = 0
+
+        root_zpool = self._get_root_zpool()
+        BYTES_IN_1GB = 1073741824
+
         size = self._get_zpool_property('size', root_zpool)
         if size is not None:
-            host_stats['local_gb'] = Size(size).get(Size.gb_units)
+            host_stats['local_gb'] = int(size / BYTES_IN_1GB)
         else:
             host_stats['local_gb'] = 0
+
+        free = self._get_zpool_property('free', root_zpool)
+        if free is not None:
+            free_disk_gb = int(free / BYTES_IN_1GB)
+        else:
+            free_disk_gb = 0
+        host_stats['local_gb_used'] = host_stats['local_gb'] - free_disk_gb
 
         # Account for any existing processor sets by looking at the the number
         # of CPUs not assigned to any processor sets.
@@ -4004,23 +4081,6 @@ class SolarisZonesDriver(driver.ComputeDriver):
             host_stats['vcpus_used'] = host_stats['vcpus'] - data['ncpus']
         else:
             host_stats['vcpus_used'] = 0
-
-        # Subtract the number of free pages from the total to get the used.
-        uri = "kstat:/pages/unix/system_pages"
-        data = self._kstat_data(uri)
-        if data is not None:
-            free_ram = data['freemem']
-            free_ram = self._pages_to_kb(free_ram) / 1024
-            host_stats['memory_mb_used'] = host_stats['memory_mb'] - free_ram
-        else:
-            host_stats['memory_mb_used'] = 0
-
-        free = self._get_zpool_property('free', root_zpool)
-        if free is not None:
-            free_disk_gb = Size(free).get(Size.gb_units)
-        else:
-            free_disk_gb = 0
-        host_stats['local_gb_used'] = host_stats['local_gb'] - free_disk_gb
 
         host_stats['hypervisor_type'] = fields.HVType.SOLARISZONES
         host_stats['hypervisor_version'] = \
@@ -4050,10 +4110,10 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         resources = {}
         resources['vcpus'] = host_stats['vcpus']
-        resources['memory_mb'] = host_stats['memory_mb']
-        resources['local_gb'] = host_stats['local_gb']
         resources['vcpus_used'] = host_stats['vcpus_used']
+        resources['memory_mb'] = host_stats['memory_mb']
         resources['memory_mb_used'] = host_stats['memory_mb_used']
+        resources['local_gb'] = host_stats['local_gb']
         resources['local_gb_used'] = host_stats['local_gb_used']
         resources['hypervisor_type'] = host_stats['hypervisor_type']
         resources['hypervisor_version'] = host_stats['hypervisor_version']
