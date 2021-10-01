@@ -50,9 +50,9 @@ from oslo_utils import excutils
 from oslo_utils import fileutils
 from oslo_utils import strutils
 from oslo_utils import versionutils
+from oslo_utils import units
 from passlib.hash import sha256_crypt
 
-from nova import conf as cfg
 from nova.api.metadata import base as instance_metadata
 from nova.api.metadata import password
 from nova.virt import arch
@@ -635,7 +635,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
     def _pages_to_kb(self, pages):
         """Convert a number of pages of memory into a total size in KBytes."""
-        return (pages * self._pagesize) / 1024
+        return (pages * self._pagesize) / units.Ki
 
     def _get_max_mem(self, zone):
         """Return the maximum memory in KBytes allowed."""
@@ -646,7 +646,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         max_mem = lookup_resource_property(zone, 'capped-memory', mem_resource)
         if max_mem is not None:
-            return strutils.string_to_bytes("%sB" % max_mem) / 1024
+            return strutils.string_to_bytes("%sB" % max_mem) / units.Ki
 
         # If physical property in capped-memory doesn't exist, this may
         # represent a non-global zone so just return the system's total
@@ -1096,9 +1096,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
 #            instance['instance_type_id'])
         return instance.flavor
 
-    def _fetch_image(self, context, instance, image_meta):
+    def _fetch_image(self, context, instance):
         """Fetch an image using Glance given the instance's image_ref."""
-        LOG.debug('Fetch image', image_meta)
         glancecache_dirname = CONF.solariszones.glancecache_dirname
         fileutils.ensure_tree(glancecache_dirname)
         iref = instance['image_ref']
@@ -1341,6 +1340,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
     def _create_boot_volume(self, context, instance):
         """Create a (Cinder) volume service backed boot volume"""
+        LOG.debug('Creating boot volume')
         boot_vol_az = CONF.solariszones.boot_volume_az
         boot_vol_type = CONF.solariszones.boot_volume_type
         try:
@@ -1365,6 +1365,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
     def _connect_boot_volume(self, volume, mountpoint, context, instance):
         """Connect a (Cinder) volume service backed boot volume"""
+        LOG.debug('Connecting boot volume')
         instance_uuid = instance['uuid']
         volume_id = volume['id']
 
@@ -1703,7 +1704,6 @@ class SolarisZonesDriver(driver.ComputeDriver):
         network_plugin = neutron_api.get_client(context, admin=True)
         network = network_plugin.show_network(
             vif['network']['id'])['network']
-        LOG.debug(network, vif)
         network_type = network['provider:network_type']
         lower_link = None
         vlan_id = 0
@@ -1770,7 +1770,6 @@ class SolarisZonesDriver(driver.ComputeDriver):
     def _set_network(self, context, name, instance, network_info, brand,
                      sc_dir):
         """add networking information to the zone."""
-        LOG.debug(network_info)
         zone = self._get_zone_by_name(name)
         if zone is None:
             raise exception.InstanceNotFound(instance_id=name)
@@ -2323,15 +2322,17 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         return True
 
-    def spawn(self, context, instance, image_meta, injected_files,
+
+    def _spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None, power_on=True, accel_info=None):
-        LOG.info("Spawning new instance named ", instance.name)
-
+        LOG.info("Spawning new instance named %s" % instance.name)
+        LOG.debug(block_device_info)
         """Create a new instance/VM/domain on the virtualization platform.
 
         Once this successfully completes, the instance should be
-        running (power_state.RUNNING).
+        running (power_state.RUNNING) if ``power_on`` is True, else the
+        instance should be stopped (power_state.SHUTDOWN).
 
         If this fails, any partial instance should be completely
         cleaned up, and the virtualization platform should be in the state
@@ -2351,33 +2352,110 @@ class SolarisZonesDriver(driver.ComputeDriver):
         :param network_info: instance network information
         :param block_device_info: Information about block devices to be
                                   attached to the instance.
+        :param power_on: True if the instance should be powered on, False
+                         otherwise
+        :param arqs: List of bound accelerator requests for this instance.
+            [
+             {'uuid': $arq_uuid,
+              'device_profile_name': $dp_name,
+              'device_profile_group_id': $dp_request_group_index,
+              'state': 'Bound',
+              'device_rp_uuid': $resource_provider_uuid,
+              'hostname': $host_nodename,
+              'instance_uuid': $instance_uuid,
+              'attach_handle_info': {  # PCI bdf
+                'bus': '0c', 'device': '0', 'domain': '0000', 'function': '0'},
+              'attach_handle_type': 'PCI'
+                   # or 'TEST_PCI' for Cyborg fake driver
+             }
+            ]
+            Also doc'd in nova/accelerator/cyborg.py::get_arqs_for_instance()
         """
-        LOG.debug('XXXXXXXXXXXXXXXXXXXXX', instance, image_meta)
+        name = instance.name
 
-        image = self._fetch_image(context, instance, image_meta)
-        self._validate_image(context, image, instance)
+        if instance.image_ref:
+            image = self._fetch_image(context, instance, image_meta)
+
+        self._validate_flavor(instance)
+
+    def spawn(self, context, instance, image_meta, injected_files,
+              admin_password, allocations, network_info=None,
+              block_device_info=None, power_on=True, accel_info=None):
+        LOG.info("Spawning new instance named %s" % instance.name)
+        LOG.debug(block_device_info)
+        """Create a new instance/VM/domain on the virtualization platform.
+
+        Once this successfully completes, the instance should be
+        running (power_state.RUNNING) if ``power_on`` is True, else the
+        instance should be stopped (power_state.SHUTDOWN).
+
+        If this fails, any partial instance should be completely
+        cleaned up, and the virtualization platform should be in the state
+        that it was before this call began.
+
+        :param context: security context
+        :param instance: nova.objects.instance.Instance
+                         This function should use the data there to guide
+                         the creation of the new instance.
+        :param nova.objects.ImageMeta image_meta:
+            The metadata of the image of the instance.
+        :param injected_files: User files to inject into instance.
+        :param admin_password: Administrator password to set in instance.
+        :param allocations: Information about resources allocated to the
+                            instance via placement, of the form returned by
+                            SchedulerReportClient.get_allocations_for_consumer.
+        :param network_info: instance network information
+        :param block_device_info: Information about block devices to be
+                                  attached to the instance.
+        :param power_on: True if the instance should be powered on, False
+                         otherwise
+        :param arqs: List of bound accelerator requests for this instance.
+            [
+             {'uuid': $arq_uuid,
+              'device_profile_name': $dp_name,
+              'device_profile_group_id': $dp_request_group_index,
+              'state': 'Bound',
+              'device_rp_uuid': $resource_provider_uuid,
+              'hostname': $host_nodename,
+              'instance_uuid': $instance_uuid,
+              'attach_handle_info': {  # PCI bdf
+                'bus': '0c', 'device': '0', 'domain': '0000', 'function': '0'},
+              'attach_handle_type': 'PCI'
+                   # or 'TEST_PCI' for Cyborg fake driver
+             }
+            ]
+            Also doc'd in nova/accelerator/cyborg.py::get_arqs_for_instance()
+        """
+        name = instance.name
+
+        if instance.image_ref:
+            image = self._fetch_image(context, instance, image_meta)
+            self._validate_image(context, image, instance)
+
         self._validate_flavor(instance)
 
         # c1d0 is the standard dev for the default boot device.
         # Irrelevant value for ZFS, but Cinder gets stroppy without it.
         mountpoint = "c1d0"
 
-        # Ensure no block device mappings attempt to use the reserved boot
-        # device (c1d0).
-        for entry in block_device_info.get('block_device_mapping'):
-            if entry['connection_info'] is None:
-                continue
-
-            mount_device = entry['mount_device']
-            if mount_device == '/dev/' + mountpoint:
-                msg = (_("Unable to assign '%s' to block device as it is"
-                         "reserved for the root file system") % mount_device)
-                raise exception.InvalidDiskInfo(msg)
 
         # Attempt to provision a (Cinder) volume service backed boot volume
-        volume = self._create_boot_volume(context, instance)
-        volume_id = volume['id']
-        name = instance['name']
+        create_root_volume = True
+        if create_root_volume:
+            # Ensure no block device mappings attempt to use the reserved boot
+            # device (c1d0).
+            for entry in block_device_info.get('block_device_mapping'):
+                if entry['connection_info'] is None:
+                    continue
+
+                mount_device = entry['mount_device']
+                if mount_device == '/dev/' + mountpoint:
+                    msg = (_("Unable to assign '%s' to block device as it is"
+                            "reserved for the root file system") % mount_device)
+                    raise exception.InvalidDiskInfo(msg)
+
+            volume = self._create_boot_volume(context, instance)
+            volume_id = volume['id']
         try:
             connection_info = self._connect_boot_volume(volume, mountpoint,
                                                         context, instance)
@@ -4041,33 +4119,28 @@ class SolarisZonesDriver(driver.ComputeDriver):
         host_stats['vcpus'] = os.sysconf('SC_NPROCESSORS_ONLN')
 
         total_pages = os.sysconf('SC_PHYS_PAGES')
-        host_stats['memory_mb'] = int(self._pages_to_kb(total_pages) / 1024)
+        host_stats['memory_mb'] = int(self._pages_to_kb(total_pages) / units.Ki)
 
         # Subtract the number of free pages from the total to get the used.
         uri = "kstat:/pages/unix/system_pages"
         data = self._kstat_data(uri)
         if data is not None:
-            free_pages = data['pagesfree']
-            used_pages = total_pages - free_pages
-            used_ram_kb = self._pages_to_kb(used_pages)
-            host_stats['memory_mb_used'] = int(used_ram_kb / 1024)
-            LOG.debug('total_pages: %d, free_pages: %d, used_pages: %d, used_ram_kb: %d, memory_mb_used: %d' %
-                (total_pages, free_pages, used_pages, used_ram_kb, host_stats['memory_mb_used']))
+            used_pages = total_pages - data['pagesfree']
+            host_stats['memory_mb_used'] = int(self._pages_to_kb(used_pages) / units.Ki)
         else:
             host_stats['memory_mb_used'] = 0
 
         root_zpool = self._get_root_zpool()
-        BYTES_IN_1GB = 1073741824
 
         size = self._get_zpool_property('size', root_zpool)
         if size is not None:
-            host_stats['local_gb'] = int(size / BYTES_IN_1GB)
+            host_stats['local_gb'] = int(size / units.Gi)
         else:
             host_stats['local_gb'] = 0
 
         free = self._get_zpool_property('free', root_zpool)
         if free is not None:
-            free_disk_gb = int(free / BYTES_IN_1GB)
+            free_disk_gb = int(free / units.Gi)
         else:
             free_disk_gb = 0
         host_stats['local_gb_used'] = host_stats['local_gb'] - free_disk_gb
@@ -4122,6 +4195,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         resources['disk_available_least'] = host_stats['disk_available_least']
         resources['supported_instances'] = host_stats['supported_instances']
         resources['numa_topology'] = host_stats['numa_topology']
+
         return resources
 
     def get_available_resource(self, nodename):
@@ -5143,7 +5217,6 @@ class SolarisZonesDriver(driver.ComputeDriver):
         raise NotImplementedError()
 
     def default_root_device_name(self, instance, image_meta, root_bdm):
-        LOG.debug("default_root_device_name")
         """Provide a default root device name for the driver.
 
         :param nova.objects.instance.Instance instance:
@@ -5153,7 +5226,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
         :param nova.objects.BlockDeviceMapping root_bdm:
             The description of the root device.
         """
-        raise NotImplementedError()
+        LOG.debug("default_root_device_name")
+        return '/dev/c1d0'
 
     def default_device_names_for_instance(self, instance, root_device_name,
                                           *block_device_lists):
