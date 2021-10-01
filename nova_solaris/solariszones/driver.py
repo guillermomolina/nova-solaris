@@ -30,7 +30,6 @@ import tempfile
 import uuid
 
 from collections import defaultdict
-# from openstack_common import get_ovsdb_info
 import rad.bindings.com.oracle.solaris.rad.archivemgr_1 as archivemgr
 import rad.bindings.com.oracle.solaris.rad.kstat_2 as kstat
 import rad.bindings.com.oracle.solaris.rad.zonemgr_1 as zonemgr
@@ -1514,190 +1513,14 @@ class SolarisZonesDriver(driver.ComputeDriver):
         with ZoneConfig(zone) as zc:
             zc.setprop('capped-memory', mem_resource, '%dM' % memory_mb)
 
-    def _ovs_add_port(self, instance, vif, port):
-        LOG.deug("OVS used")
-        return
-        if vif['type'] == 'binding_failed':
-            LOG.error(_('Port binding has failed for VIF %s. Ensure that '
-                        'OVS agent is running and/or bridge_mappings are '
-                        'correctly configured. VM will not have network '
-                        'connectivity') % vif)
-
-        ovs_bridge = CONF.neutron.ovs_bridge
-        cmd = ['/usr/sbin/ovs-vsctl',
-               '--timeout=%s' % CONF.ovs_vsctl_timeout,
-               '--', '--if-exists', 'del-port', ovs_bridge, port,
-               '--', 'add-port', ovs_bridge, port,
-               '--', 'set', 'Interface', port,
-               'external-ids:iface-id=%s' % vif['id'],
-               'external-ids:iface-status=active',
-               'external-ids:attached-mac=%s' % vif['address'],
-               'external-ids:vm-uuid=%s' % instance['uuid']
-               ]
-        try:
-            out, err = processutils.execute(*cmd)
-        except Exception as reason:
-            msg = (_("Failed to add port '%s' with MAC address '%s' to "
-                     "OVS Bridge '%s': %s")
-                   % (port, vif['address'], ovs_bridge, reason))
-            raise exception.NovaException(msg)
-        LOG.debug(_('Successfully added port %s with MAC adddress %s') %
-                  (port, vif['address']))
-
-    def _ovs_delete_port(self, port, log_warnings=False):
-        LOG.debug("OVS used")
-        return
-        ovs_bridge = CONF.neutron.ovs_bridge
-        cmd = ['/usr/sbin/ovs-vsctl',
-               '--timeout=%s' % CONF.ovs_vsctl_timeout,
-               '--', '--if-exists', 'del-port', ovs_bridge, port]
-        try:
-            out, err = processutils.execute(*cmd)
-            LOG.debug(_('Removed port %s from the OVS bridge %s') %
-                      (port, ovs_bridge))
-        except Exception as reason:
-            msg = (_("Unable to remove port '%s' from the OVS "
-                     "bridge '%s': %s") % (port, ovs_bridge, reason))
-            if log_warnings:
-                LOG.warning(msg)
-            else:
-                raise nova.exception.NovaException(msg)
-
     def _plug_vifs(self, instance, network_info):
         LOG.debug("_plug_vifs instance: %s, network info: %s",
                   instance, network_info)
         return
-        if not network_info:
-            LOG.debug(_("Instance has no VIF. Nothing to plug."))
-            return
-
-        # first find out all the anets for a given instance
-        try:
-            out, err = processutils.execute('/usr/sbin/dladm', 'show-vnic',
-                                     '-z', instance['name'],
-                                     '-po', 'link,macaddress')
-        except Exception as reason:
-            msg = (_("Unable to get interfaces for instance '%s': %s")
-                   % (instance['name'], reason))
-            raise exception.NovaException(msg)
-
-        anetdict = {}
-        for anet_maddr in out.strip().splitlines():
-            anet, maddr = anet_maddr.strip().split(':', 1)
-            maddr = maddr.replace('\\', '')
-            maddr = ''.join(['%02x' % int(b, 16) for b in maddr.split(':')])
-            anetdict[maddr] = anet
-
-        LOG.debug(_("List of instance %s's anets: %s")
-                  % (instance['name'], anetdict))
-        # we now have a list of VNICs that belong to the VM
-        # we need to map the VNIC to the bridge
-        for vif in network_info:
-            vif_maddr = ''.join(['%02x' % int(b, 16) for b in
-                                 vif['address'].split(':')])
-            anet = anetdict.get(vif_maddr)
-            if anet is None:
-                LOG.error(_('Failed to add port %s connected to network %s '
-                            'to instance %s')
-                          % (vif['ovs_interfaceid'], vif['network']['id'],
-                             instance['name']))
-                continue
-            self._ovs_add_port(instance, vif, anet)
 
     def _unplug_vifs(self, instance):
         LOG.debug("_unplug_vifs instance: %s", instance)
         return
-        ovs_bridge = CONF.neutron.ovs_bridge
-        # remove the anets from the OVS bridge
-        cmd = ['/usr/sbin/ovs-vsctl', '--timeout=%s' % CONF.ovs_vsctl_timeout,
-               'list-ports', ovs_bridge]
-        try:
-            out, err = processutils.execute(*cmd)
-        except Exception as reason:
-            msg = (_("Unable to get interfaces for instance '%s': %s")
-                   % (instance['name'], reason))
-            raise exception.NovaException(msg)
-
-        for port in out.strip().splitlines():
-            if port.split('/')[0] != instance['name']:
-                continue
-            self._ovs_delete_port(port, log_warnings=True)
-
-    def _set_ovs_info(self, context, zone, brand, first_anet, vif):
-        # Need to be admin to retrieve provider:network_type attribute
-        network_plugin = neutron_api.get_client(context, admin=True)
-        network = network_plugin.show_network(
-            vif['network']['id'])['network']
-        network_type = network['provider:network_type']
-        lower_link = None
-        if network_type == 'vxlan':
-            lower_link = 'ovs.vxlan1'
-        elif network_type in ['vlan', 'flat']:
-            physical_network = network['provider:physical_network']
-            # retrieve the other_config information from Open_vSwitch table
-            try:
-                results = get_ovsdb_info('Open_vSwitch', ['other_config'])
-            except Exception as err:
-                LOG.exception(_("Failed to retrieve other_config: %s"), err)
-                raise
-
-            other_config = results[0]['other_config']
-            if not other_config:
-                msg = (_("'other_config' column in 'Open_vSwitch' OVSDB table "
-                         "is not configured. Please configure it so that the "
-                         "lower-link can be determined for the instance's "
-                         "interface."))
-                LOG.error(msg)
-                raise exception.NovaException(msg)
-            bridge_mappings = other_config.get('bridge_mappings')
-            if not bridge_mappings:
-                msg = (_("'bridge_mappings' info is not set in the "
-                         "'other_config' column of 'Open_vSwitch' OVSDB "
-                         "table. Please configure it so that the lower-link "
-                         "can be determined for the instance's interface."))
-                LOG.error(msg)
-                raise exception.NovaException(msg)
-            for bridge_mapping in bridge_mappings.split(','):
-                if physical_network in bridge_mapping:
-                    lower_link = bridge_mapping.split(':')[1]
-                    break
-            if not lower_link:
-                msg = (_("Failed to determine the lower_link for vif '%s'.") %
-                       (vif))
-                LOG.error(msg)
-                raise exception.NovaException(msg)
-        else:
-            # TYPE_GRE and TYPE_LOCAL
-            msg = (_("Unsupported network type: %s") % network_type)
-            LOG.error(msg)
-            raise exception.NovaException(msg)
-
-        mtu = network['mtu']
-        with ZoneConfig(zone) as zc:
-            if first_anet:
-                zc.setprop('anet', 'lower-link', lower_link)
-                zc.setprop('anet', 'configure-allowed-address', 'false')
-                zc.setprop('anet', 'mac-address', vif['address'])
-                if mtu > 0:
-                    zc.setprop('anet', 'mtu', str(mtu))
-            else:
-                props = [zonemgr.Property('lower-link', lower_link),
-                         zonemgr.Property('configure-allowed-address',
-                                          'false'),
-                         zonemgr.Property('mac-address', vif['address'])]
-                if mtu > 0:
-                    props.append(zonemgr.Property('mtu', str(mtu)))
-                zc.addresource('anet', props)
-
-            prop_filter = [zonemgr.Property('mac-address', vif['address'])]
-            if brand == ZONE_BRAND_SOLARIS:
-                anetname = lookup_resource_property(zc.zone, 'anet',
-                                                    'linkname', prop_filter)
-            else:
-                anetid = lookup_resource_property(zc.zone, 'anet', 'id',
-                                                  prop_filter)
-                anetname = 'net%s' % anetid
-        return anetname
 
     def _set_net_info(self, context, zone, brand, first_anet, vif):
         # Need to be admin to retrieve provider:network_type attribute
@@ -3247,10 +3070,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
                     zc.removeresources('anet', prop_filter)
                 raise nova.exception.NovaException(msg)
 
-            # add port to ovs bridge
             anet = ''.join([name, '/', anetname])
             self._vif_driver.plug(instance, vif)
-#            self._ovs_add_port(instance, vif, anet)
 
     def detach_interface(self, instance, vif):
         LOG.debug("detach_interface")
@@ -3319,7 +3140,6 @@ class SolarisZonesDriver(driver.ComputeDriver):
             # remove anet from OVS bridge
             port = ''.join([name, '/', anetname])
             self._vif_driver.unplug(instance, vif)
-#           self._ovs_delete_port(port)
 
     def _cleanup_migrate_disk(self, context, instance, volume):
         """Make a best effort at cleaning up the volume that was created to
