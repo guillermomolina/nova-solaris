@@ -23,6 +23,7 @@ Driver for Solaris Zones (nee Containers):
 """
 import base64
 import glob
+import itertools
 import os
 import platform
 import shutil
@@ -52,6 +53,7 @@ from oslo_utils import versionutils
 from oslo_utils import units
 from passlib.hash import sha256_crypt
 
+import nova
 from nova.api.metadata import base as instance_metadata
 from nova.api.metadata import password
 from nova.virt import arch
@@ -580,7 +582,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         """ Return the iSCSI initiator node name IQN for this host """
         try:
             out, err = processutils.execute('/usr/sbin/iscsiadm', 'list',
-                                     'initiator-node')
+                                            'initiator-node')
             # Sample first line of command output:
             # Initiator node name: iqn.1986-03.com.sun:01:e00000000000.4f757217
             initiator_name_line = out.splitlines()[0]
@@ -622,9 +624,10 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 reason = ex.get_payload().info
             else:
                 reason = str(ex)
-            LOG.exception('Could not get root zpool from the active boot environment')
+            LOG.exception(
+                'Could not get root zpool from the active boot environment')
             return None
-        
+
         LOG.debug('The active boot environment is %s', be.name)
         return self._get_zpool_by_name(be.zpool)
 
@@ -709,7 +712,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         except Exception as reason:
             LOG.warning(_("Unable to retrieve kstat object '%s' via kstat(3RAD): "
-                       "%s") % (uri, reason))
+                          "%s") % (uri, reason))
             return None
 
         ks_data = {}
@@ -1195,16 +1198,20 @@ class SolarisZonesDriver(driver.ComputeDriver):
                     memsize=str(instance['memory_mb']),
                     align='256')
 
+        return brand
+
     def _suri_from_volume_info(self, connection_info):
         """Returns a suri(5) formatted string based on connection_info.
         Currently supports local ZFS volume, NFS, Fibre Channel and iSCSI
         driver types.
         """
         driver_type = connection_info['driver_volume_type']
-        if driver_type not in ['iscsi', 'fibre_channel', 'local', 'nfs']:
+        if driver_type not in ['iscsi', 'fibre_channel', 'local', 'nfs', 'file']:
             raise exception.VolumeDriverNotFound(driver_type=driver_type)
         if driver_type == 'local':
             suri = 'dev:/dev/zvol/dsk/%s' % connection_info['volume_path']
+        elif driver_type == 'file':
+            suri = 'file://root:root@%s' % connection_info['volume_path']
         elif driver_type == 'iscsi':
             data = connection_info['data']
             # suri(5) format:
@@ -1221,11 +1228,11 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 target_lun = data['target_luns'][0]
                 try:
                     processutils.execute('/usr/sbin/iscsiadm', 'list', 'target',
-                                  '-vS', target)
+                                         '-vS', target)
                     out, err = processutils.execute('/usr/sbin/suriadm', 'lookup-uri',
-                                             '-t', 'iscsi',
-                                             '-p', 'target=%s' % target,
-                                             '-p', 'lun=%s' % target_lun)
+                                                    '-t', 'iscsi',
+                                                    '-p', 'target=%s' % target,
+                                                    '-p', 'lun=%s' % target_lun)
                     for line in [l.strip() for l in out.splitlines()]:
                         if "luname.naa." in line:
                             LOG.debug(_("The found luname-only URI for the "
@@ -1287,8 +1294,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
             for wwn in wwns:
                 try:
                     out, err = processutils.execute('/usr/sbin/suriadm', 'lookup-uri',
-                                             '-p', 'target=naa.%s' % wwn,
-                                             '-p', 'lun=%s' % target_lun)
+                                                    '-p', 'target=naa.%s' % wwn,
+                                                    '-p', 'lun=%s' % target_lun)
                     for line in [l.strip() for l in out.splitlines()]:
                         if line.startswith("lu:luname.naa."):
                             return line
@@ -1548,7 +1555,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
                 if not vlan_id:
                     msg = (_("Failed to determine the vlan_id for vif '%s'.") %
-                          (vif))
+                           (vif))
                     LOG.error(msg)
                     raise exception.NovaException(msg)
 
@@ -1589,6 +1596,9 @@ class SolarisZonesDriver(driver.ComputeDriver):
                                                   prop_filter)
                 anetname = 'net%s' % anetid
         return anetname
+
+    def _create_zvol_from_file(self):
+        pass
 
     def _set_network(self, context, name, instance, network_info, brand,
                      sc_dir):
@@ -1669,8 +1679,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
         system/config-user to configure the root account.  If an SSH key is
         specified, configure root's profile to use it.
         """
-        usercheck = lambda e: e.attrib.get('name') == 'system/config-user'
-        hostcheck = lambda e: e.attrib.get('name') == 'system/identity'
+        def usercheck(e): return e.attrib.get('name') == 'system/config-user'
+        def hostcheck(e): return e.attrib.get('name') == 'system/identity'
 
         root_account_needed = True
         hostname_needed = True
@@ -1824,7 +1834,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         # TODO(npower): investigate using RAD instead of CLI invocation
         try:
             out, err = processutils.execute('/usr/sbin/svccfg',
-                                     '-s', VNC_CONSOLE_BASE_FMRI, 'add', name)
+                                            '-s', VNC_CONSOLE_BASE_FMRI, 'add', name)
         except processutils.ProcessExecutionError as ex:
             if self._has_vnc_console_service(instance):
                 LOG.debug(_("Ignoring attempt to create existing zone VNC "
@@ -1843,8 +1853,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
         # TODO(npower): investigate using RAD instead of CLI invocation
         try:
             out, err = processutils.execute('/usr/sbin/svccfg',
-                                     '-s', VNC_CONSOLE_BASE_FMRI, 'delete',
-                                     name)
+                                            '-s', VNC_CONSOLE_BASE_FMRI, 'delete',
+                                            name)
         except processutils.ProcessExecutionError as ex:
             if not self._has_vnc_console_service(instance):
                 LOG.debug(_("Ignoring attempt to delete a non-existent zone "
@@ -1868,11 +1878,11 @@ class SolarisZonesDriver(driver.ComputeDriver):
             # unnecessarily coming online at boot. Tell it to really bring
             # it online.
             out, err = processutils.execute('/usr/sbin/svccfg', '-s', console_fmri,
-                                     'setprop', 'vnc/nova-enabled=true')
+                                            'setprop', 'vnc/nova-enabled=true')
             out, err = processutils.execute('/usr/sbin/svccfg', '-s', console_fmri,
-                                     'refresh')
+                                            'refresh')
             out, err = processutils.execute('/usr/sbin/svcadm', 'enable',
-                                     console_fmri)
+                                            console_fmri)
         except processutils.ProcessExecutionError as ex:
             if not self._has_vnc_console_service(instance):
                 LOG.debug(_("Ignoring attempt to enable a non-existent zone "
@@ -1889,7 +1899,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         while True:
             try:
                 out, err = processutils.execute('/usr/bin/svcs', '-H', '-o', 'state',
-                                         console_fmri)
+                                                console_fmri)
                 state = out.strip()
                 if state == 'online':
                     break
@@ -1912,9 +1922,9 @@ class SolarisZonesDriver(driver.ComputeDriver):
             # The console SMF service exits with SMF_TEMP_DISABLE to prevent
             # unnecessarily coming online at boot. Make that happen.
             out, err = processutils.execute('/usr/sbin/svccfg', '-s', console_fmri,
-                                     'setprop', 'vnc/nova-enabled=false')
+                                            'setprop', 'vnc/nova-enabled=false')
             out, err = processutils.execute('/usr/sbin/svccfg', '-s', console_fmri,
-                                     'refresh')
+                                            'refresh')
         except processutils.ProcessExecutionError as ex:
             reason = ex.stderr
             LOG.exception(_("Unable to update 'vnc/nova-enabled' property for "
@@ -1933,7 +1943,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         # TODO(npower): investigate using RAD instead of CLI invocation
         try:
             out, err = processutils.execute('/usr/sbin/svcadm', 'disable',
-                                     '-s', console_fmri)
+                                            '-s', console_fmri)
         except processutils.ProcessExecutionError as ex:
             reason = ex.stderr
             LOG.exception(_("Unable to disable zone VNC console SMF service "
@@ -1943,7 +1953,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         # refreshed to reset the property value
         try:
             out, err = processutils.execute('/usr/sbin/svccfg', '-s', console_fmri,
-                                     'refresh')
+                                            'refresh')
         except processutils.ProcessExecutionError as ex:
             reason = ex.stderr
             LOG.exception(_("Unable to refresh zone VNC console SMF service "
@@ -1961,7 +1971,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         # TODO(npower): investigate using RAD instead of CLI invocation
         try:
             state, err = processutils.execute('/usr/sbin/svcs', '-H', '-o', 'state',
-                                       console_fmri)
+                                              console_fmri)
             return state.strip()
         except processutils.ProcessExecutionError as ex:
             reason = ex.stderr
@@ -2014,6 +2024,36 @@ class SolarisZonesDriver(driver.ComputeDriver):
         self._set_instance_metahostid(instance)
 
         LOG.debug(_("Installation of instance '%s' (%s) complete") %
+                  (name, instance['display_name']))
+
+    def _attach(self, instance):
+        """Install a new Solaris Zone root file system."""
+        name = instance['name']
+        zone = self._get_zone_by_name(name)
+        if zone is None:
+            raise exception.InstanceNotFound(instance_id=name)
+
+        # log the zone's configuration
+        with ZoneConfig(zone) as zc:
+            LOG.debug("-" * 80)
+            LOG.debug(zc.zone.exportConfig(True))
+            LOG.debug("-" * 80)
+
+        options = ['-x', 'initialize-hostdata']
+
+        try:
+            LOG.debug(_("Attaching instance '%s' (%s)") %
+                      (name, instance['display_name']))
+            zone.attach(options=options)
+        except Exception as ex:
+            reason = zonemgr_strerror(ex)
+            LOG.exception(_("Unable to attach root file system for instance "
+                            "'%s' via zonemgr(3RAD): %s") % (name, reason))
+            raise
+
+        self._set_instance_metahostid(instance)
+
+        LOG.debug(_("Attaching of instance '%s' (%s) complete") %
                   (name, instance['display_name']))
 
     def _power_on(self, instance, network_info):
@@ -2112,8 +2152,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
         while cbi_state not in end_states:
             try:
                 cbi_state, err = processutils.execute('/usr/sbin/zlogin', '-S', name,
-                                               '/usr/bin/svcs', '-H', '-o',
-                                               'state', cbi_service)
+                                                      '/usr/bin/svcs', '-H', '-o',
+                                                      'state', cbi_service)
                 cbi_state = cbi_state.strip()
             except processutils.ProcessExecutionError:
                 # If it has been two minutes and the zone is still not able to
@@ -2129,83 +2169,29 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
             if cbi_state == "disabled" and cbi_state in end_states:
                 out, err = processutils.execute('/usr/sbin/zlogin', '-S', name,
-                                         '/usr/bin/svcprop', '-p',
-                                         'general/enabled', cbi_service)
+                                                '/usr/bin/svcprop', '-p',
+                                                'general/enabled', cbi_service)
                 out = out.strip()
                 if out == "true":
                     end_states.remove('disabled')
 
             if cbi_state == "offline*":
                 out, err = processutils.execute('/usr/sbin/zlogin', '-S', name,
-                                         '/usr/bin/svcprop', '-C', '-p',
-                                         'configdrive/copydone', cbi_service)
+                                                '/usr/bin/svcprop', '-C', '-p',
+                                                'configdrive/copydone', cbi_service)
                 out = out.strip()
                 if out == "true":
                     break
 
         return True
 
-
-    def _spawn(self, context, instance, image_meta, injected_files,
-              admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True, accel_info=None):
-        LOG.info("Spawning new instance named %s" % instance.name)
-        LOG.debug(block_device_info)
-        """Create a new instance/VM/domain on the virtualization platform.
-
-        Once this successfully completes, the instance should be
-        running (power_state.RUNNING) if ``power_on`` is True, else the
-        instance should be stopped (power_state.SHUTDOWN).
-
-        If this fails, any partial instance should be completely
-        cleaned up, and the virtualization platform should be in the state
-        that it was before this call began.
-
-        :param context: security context
-        :param instance: nova.objects.instance.Instance
-                         This function should use the data there to guide
-                         the creation of the new instance.
-        :param nova.objects.ImageMeta image_meta:
-            The metadata of the image of the instance.
-        :param injected_files: User files to inject into instance.
-        :param admin_password: Administrator password to set in instance.
-        :param allocations: Information about resources allocated to the
-                            instance via placement, of the form returned by
-                            SchedulerReportClient.get_allocations_for_consumer.
-        :param network_info: instance network information
-        :param block_device_info: Information about block devices to be
-                                  attached to the instance.
-        :param power_on: True if the instance should be powered on, False
-                         otherwise
-        :param arqs: List of bound accelerator requests for this instance.
-            [
-             {'uuid': $arq_uuid,
-              'device_profile_name': $dp_name,
-              'device_profile_group_id': $dp_request_group_index,
-              'state': 'Bound',
-              'device_rp_uuid': $resource_provider_uuid,
-              'hostname': $host_nodename,
-              'instance_uuid': $instance_uuid,
-              'attach_handle_info': {  # PCI bdf
-                'bus': '0c', 'device': '0', 'domain': '0000', 'function': '0'},
-              'attach_handle_type': 'PCI'
-                   # or 'TEST_PCI' for Cyborg fake driver
-             }
-            ]
-            Also doc'd in nova/accelerator/cyborg.py::get_arqs_for_instance()
-        """
-        name = instance.name
-
-        if instance.image_ref:
-            image = self._fetch_image(context, instance, image_meta)
-
-        self._validate_flavor(instance)
-
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None, power_on=True, accel_info=None):
         LOG.info("Spawning new instance named %s" % instance.name)
+        LOG.debug(instance)
         LOG.debug(block_device_info)
+        LOG.debug(image_meta)
         """Create a new instance/VM/domain on the virtualization platform.
 
         Once this successfully completes, the instance should be
@@ -2250,52 +2236,31 @@ class SolarisZonesDriver(driver.ComputeDriver):
             Also doc'd in nova/accelerator/cyborg.py::get_arqs_for_instance()
         """
         name = instance.name
+        brand = self._validate_flavor(instance)
+
+        boot_info = {}
 
         if instance.image_ref:
-            image = self._fetch_image(context, instance, image_meta)
-            self._validate_image(context, image, instance)
-
-        self._validate_flavor(instance)
-
-        # c1d0 is the standard dev for the default boot device.
-        # Irrelevant value for ZFS, but Cinder gets stroppy without it.
-        mountpoint = "c1d0"
-
-
-        # Attempt to provision a (Cinder) volume service backed boot volume
-        create_root_volume = True
-        if create_root_volume:
-            # Ensure no block device mappings attempt to use the reserved boot
-            # device (c1d0).
-            for entry in block_device_info.get('block_device_mapping'):
-                if entry['connection_info'] is None:
-                    continue
-
-                mount_device = entry['mount_device']
-                if mount_device == '/dev/' + mountpoint:
-                    msg = (_("Unable to assign '%s' to block device as it is"
-                            "reserved for the root file system") % mount_device)
-                    raise exception.InvalidDiskInfo(msg)
-
-            volume = self._create_boot_volume(context, instance)
-            volume_id = volume['id']
-        try:
-            connection_info = self._connect_boot_volume(volume, mountpoint,
-                                                        context, instance)
-        except exception.InvalidVolume as reason:
-            # This Cinder volume is not usable for ZOSS so discard it.
-            # zonecfg will apply default zonepath dataset configuration
-            # instead. Carry on
-            LOG.warning(_("Volume '%s' is being discarded: %s")
-                        % (volume_id, reason))
-            self._volume_api.delete(context, volume_id)
-            connection_info = None
-        except Exception as reason:
-            # Something really bad happened. Don't pass Go.
-            LOG.exception(_("Unable to attach root zpool volume '%s' to "
-                            "instance %s: %s") % (volume['id'], name, reason))
-            self._volume_api.delete(context, volume_id)
-            raise
+            boot_info['image_path'] = self._fetch_image(context, instance)
+            if image_meta.container_format == 'ovf':
+                self._validate_image(
+                    context, boot_info['image_path'], instance)
+                boot_info['install'] = True
+                raise NotImplementedError()
+                # root_disk_connection_info =
+            else:
+                if brand != ZONE_BRAND_SOLARIS_KZ:
+                    reason = 'Raw devices are compatible only with kernel zones'
+                    raise exception.ImageUnacceptable(image_id=instance['image_ref'],
+                                                      reason=reason)
+                boot_info['attach'] = True
+                # TODO: copy file to local instance storage
+                volume_path = boot_info['image_path']
+                connection_info = {
+                    'driver_volume_type': 'file',
+                    'volume_path': volume_path,
+                }
+                boot_info['connection_info'] = connection_info
 
         # create a new directory for SC profiles
         sc_dir = tempfile.mkdtemp(prefix="nova-sysconfig-",
@@ -2305,8 +2270,135 @@ class SolarisZonesDriver(driver.ComputeDriver):
         # Create the configdrive if required.
         if configdrive.required_by(instance):
             instance_md = instance_metadata.InstanceMetadata(
-                              instance,
-                              content=injected_files)
+                instance,
+                content=injected_files)
+            with configdrive.ConfigDriveBuilder(instance_md=instance_md) as cd:
+                cd_path = self._get_configdrive_path(instance)
+                try:
+                    cd.make_drive(cd_path)
+                except Exception as e:
+                    LOG.warning(
+                        _("Failed to create config drive '%s'" % cd_path))
+
+        try:
+            self._create_config(context, instance, network_info,
+                                boot_info.get('connection_info'), sc_dir, admin_password)
+
+            if boot_info.get('install'):
+                self._install(instance, boot_info['image_path'], sc_dir)
+
+            if boot_info.get('attach'):
+                self._attach(instance)
+
+            for entry in block_device_info.get('block_device_mapping'):
+                if entry['connection_info'] is not None:
+                    self.attach_volume(context, entry['connection_info'],
+                                       instance, entry['mount_device'])
+
+            self._power_on(instance, network_info)
+            if configdrive.required_by(instance):
+                unset = self._waitfor_copydone(name)
+                if unset:
+                    self._unset_configdrive(name, instance)
+        except Exception as ex:
+            reason = zonemgr_strerror(ex)
+            LOG.exception(_("Unable to spawn instance '%s' via zonemgr(3RAD): "
+                            "'%s'") % (name, reason))
+            # At least attempt to uninstall the instance, depending on where
+            # the installation got to there could be things left behind that
+            # need to be cleaned up, e.g a root zpool etc.
+            try:
+                self._uninstall(instance)
+            except Exception as ex:
+                reason = zonemgr_strerror(ex)
+                LOG.debug(_("Unable to uninstall instance '%s' via "
+                            "zonemgr(3RAD): %s") % (name, reason))
+            try:
+                self._delete_config(instance)
+            except Exception as ex:
+                reason = zonemgr_strerror(ex)
+                LOG.debug(_("Unable to unconfigure instance '%s' via "
+                            "zonemgr(3RAD): %s") % (name, reason))
+
+            raise
+        finally:
+            # remove the sc_profile temp directory
+            shutil.rmtree(sc_dir)
+
+    def _spawn_old(self, context, instance, image_meta, injected_files,
+                   admin_password, allocations, network_info=None,
+                   block_device_info=None, power_on=True, accel_info=None):
+        LOG.info("Spawning new instance named %s" % instance.name)
+        LOG.debug(block_device_info)
+        name = instance.name
+        brand = self._validate_flavor(instance)
+
+        image_path = None
+        if instance.image_ref:
+            vm_mode = image_meta.properties.get('vm_mode')
+            if vm_mode == fields.VMMode.SNZ and brand != ZONE_BRAND_SOLARIS:
+                reason = _("Image is not valid for booting a native zone.")
+                raise exception.ImageUnacceptable(image_id=instance['image_ref'],
+                                                  reason=reason)
+            if vm_mode == fields.VMMode.SKZ and brand != ZONE_BRAND_SOLARIS_KZ:
+                reason = _("Image is not valid for booting a kernel zone.")
+                raise exception.ImageUnacceptable(image_id=instance['image_ref'],
+                                                  reason=reason)
+            image_path = self._fetch_image(context, instance, image_meta)
+            if image_meta.container_format == 'ovf':
+                self._validate_image(context, image_path, instance)
+
+        create_root_volume = False
+        volume_id = None
+        if create_root_volume:
+            # Attempt to provision a (Cinder) volume service backed boot volume
+
+            # c1d0 is the standard dev for the default boot device.
+            # Irrelevant value for ZFS, but Cinder gets stroppy without it.
+            mountpoint = "c1d0"
+
+            # Ensure no block device mappings attempt to use the reserved boot
+            # device (c1d0).
+            for entry in block_device_info.get('block_device_mapping'):
+                if entry['connection_info'] is None:
+                    continue
+
+                mount_device = entry['mount_device']
+                if mount_device == '/dev/' + mountpoint:
+                    msg = (_("Unable to assign '%s' to block device as it is"
+                             "reserved for the root file system") % mount_device)
+                    raise exception.InvalidDiskInfo(msg)
+
+            volume = self._create_boot_volume(context, instance)
+            volume_id = volume['id']
+            try:
+                connection_info = self._connect_boot_volume(volume, mountpoint,
+                                                            context, instance)
+            except exception.InvalidVolume as reason:
+                # This Cinder volume is not usable for ZOSS so discard it.
+                # zonecfg will apply default zonepath dataset configuration
+                # instead. Carry on
+                LOG.warning(_("Volume '%s' is being discarded: %s")
+                            % (volume_id, reason))
+                self._volume_api.delete(context, volume_id)
+                connection_info = None
+            except Exception as reason:
+                # Something really bad happened. Don't pass Go.
+                LOG.exception(_("Unable to attach root zpool volume '%s' to "
+                                "instance %s: %s") % (volume['id'], name, reason))
+                self._volume_api.delete(context, volume_id)
+                raise
+
+        # create a new directory for SC profiles
+        sc_dir = tempfile.mkdtemp(prefix="nova-sysconfig-",
+                                  dir=CONF.state_path)
+        os.chmod(sc_dir, 0o755)
+
+        # Create the configdrive if required.
+        if configdrive.required_by(instance):
+            instance_md = instance_metadata.InstanceMetadata(
+                instance,
+                content=injected_files)
             with configdrive.ConfigDriveBuilder(instance_md=instance_md) as cd:
                 cd_path = self._get_configdrive_path(instance)
                 try:
@@ -2318,7 +2410,9 @@ class SolarisZonesDriver(driver.ComputeDriver):
         try:
             self._create_config(context, instance, network_info,
                                 connection_info, sc_dir, admin_password)
-            self._install(instance, image, sc_dir)
+
+            if image_meta.container_format == 'ovf' and image_path is not None:
+                self._install(instance, image_path, sc_dir)
 
             for entry in block_device_info.get('block_device_mapping'):
                 if entry['connection_info'] is not None:
@@ -2371,7 +2465,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             bdm['connection_info'] = jsonutils.dumps(connection_info)
             bdm['source_type'] = 'volume'
             bdm['destination_type'] = 'volume'
-            bdm['device_name'] = mountpoint
+            bdm['device_name'] = 'c1d0'
             bdm['delete_on_termination'] = True
             bdm['volume_id'] = volume_id
             bdm['volume_size'] = instance['root_gb']
@@ -2699,7 +2793,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         name = instance['name']
         if instance['vm_state'] == vm_states.BUILDING:
             LOG.warning(_("VNC console not available until zone '%s' has "
-                     "completed installation. Try again later.") % name)
+                          "completed installation. Try again later.") % name)
             raise exception.InstanceNotReady(instance_id=instance['uuid'])
 
         if not self._has_vnc_console_service(instance):
@@ -2716,7 +2810,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         # TODO(npower): investigate using RAD instead of CLI invocation
         try:
             out, err = processutils.execute('/usr/sbin/svccfg', '-s', console_fmri,
-                                     'refresh')
+                                            'refresh')
         except processutils.ProcessExecutionError as ex:
             reason = ex.stderr
             LOG.exception(_("Unable to refresh zone VNC console SMF service "
@@ -2726,7 +2820,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         host = CONF.vnc.vncserver_proxyclient_address
         try:
             out, err = processutils.execute('/usr/bin/svcprop', '-p', 'vnc/port',
-                                     console_fmri)
+                                            console_fmri)
             port = int(out.strip())
             return ctype.ConsoleVNC(host=host, port=port,
                                     internal_access_path=None)
@@ -3332,10 +3426,10 @@ class SolarisZonesDriver(driver.ComputeDriver):
             out_path = os.path.join(tmpdir, snapshot_name)
             zone_name = instance['name']
             processutils.execute('/usr/sbin/archiveadm', 'create', '--root-only',
-                          '-z', zone_name, out_path)
+                                 '-z', zone_name, out_path)
 
             LOG.warning(_("Snapshot extracted, beginning image upload"),
-                     instance=instance)
+                        instance=instance)
             try:
                 # Upload the archive image to the image service
                 update_task_state(
@@ -3345,7 +3439,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
                     snapshot_service.update(context, image_id, metadata,
                                             image_file)
                     LOG.warning(_("Snapshot image upload complete"),
-                             instance=instance)
+                                instance=instance)
                 try:
                     # Try to update the image metadata container and disk
                     # formats more suitably for a unified archive if the
@@ -3502,11 +3596,11 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 # can remove this hack.
                 greenthread.sleep(15)
                 out, err = processutils.execute('/usr/sbin/zlogin', '-S', name,
-                                         '/usr/sbin/zpool', 'set',
-                                         'autoexpand=off', 'rpool')
+                                                '/usr/sbin/zpool', 'set',
+                                                'autoexpand=off', 'rpool')
                 out, err = processutils.execute('/usr/sbin/zlogin', '-S', name,
-                                         '/usr/sbin/zpool', 'set',
-                                         'autoexpand=on', 'rpool')
+                                                '/usr/sbin/zpool', 'set',
+                                                'autoexpand=on', 'rpool')
         except Exception:
             # Attempt to cleanup the new zone and new volume to at least
             # give the user a chance to recover without too many hoops
@@ -3906,7 +4000,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
         """Get the value of properties from the zpool."""
         value = None
         try:
-            prop_req = zfsmgr.ZfsPropRequest(name=prop, integer_val=integer_val)
+            prop_req = zfsmgr.ZfsPropRequest(
+                name=prop, integer_val=integer_val)
             pvalues = zpool.get_props([prop_req])
             if pvalues is None or len(pvalues) != 1:
                 raise Exception('rad get_props failed')
@@ -3939,14 +4034,16 @@ class SolarisZonesDriver(driver.ComputeDriver):
         host_stats['vcpus'] = os.sysconf('SC_NPROCESSORS_ONLN')
 
         total_pages = os.sysconf('SC_PHYS_PAGES')
-        host_stats['memory_mb'] = int(self._pages_to_kb(total_pages) / units.Ki)
+        host_stats['memory_mb'] = int(
+            self._pages_to_kb(total_pages) / units.Ki)
 
         # Subtract the number of free pages from the total to get the used.
         uri = "kstat:/pages/unix/system_pages"
         data = self._kstat_data(uri)
         if data is not None:
             used_pages = total_pages - data['pagesfree']
-            host_stats['memory_mb_used'] = int(self._pages_to_kb(used_pages) / units.Ki)
+            host_stats['memory_mb_used'] = int(
+                self._pages_to_kb(used_pages) / units.Ki)
         else:
             host_stats['memory_mb_used'] = 0
 
@@ -3991,7 +4088,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         host_stats['disk_available_least'] = free_disk_gb
         host_stats['supported_instances'] = [
-            (architecture, fields.HVType.SOLARISZONES, fields.VMMode.SOL)
+            (architecture, fields.HVType.SOLARISZONES, fields.VMMode.SNZ),
+            (architecture, fields.HVType.SOLARISZONES, fields.VMMode.SKZ)
         ]
         host_stats['numa_topology'] = None
 
@@ -4488,8 +4586,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         if zone.state == ZONE_STATE_RUNNING:
             out, err = processutils.execute('/usr/sbin/zlogin', '-S', name,
-                                     '/usr/bin/passwd', '-p',
-                                     "'%s'" % sha256_crypt.encrypt(new_pass))
+                                            '/usr/bin/passwd', '-p',
+                                            "'%s'" % sha256_crypt.encrypt(new_pass))
         else:
             raise exception.InstanceNotRunning(instance_id=name)
 
@@ -4808,7 +4906,6 @@ class SolarisZonesDriver(driver.ComputeDriver):
         """Undo for Resource Pools."""
         raise NotImplementedError()
 
-
     def get_volume_connector(self, instance):
         """Get connector information for the instance for attaching to volumes.
 
@@ -5047,13 +5144,32 @@ class SolarisZonesDriver(driver.ComputeDriver):
             The description of the root device.
         """
         LOG.debug("default_root_device_name")
-        return '/dev/c1d0'
+        raise NotImplementedError()
 
     def default_device_names_for_instance(self, instance, root_device_name,
                                           *block_device_lists):
         LOG.debug("default_device_names_for_instance")
         """Default the missing device names in the block device mapping."""
-        raise NotImplementedError()
+        block_device_mapping = list(itertools.chain(*block_device_lists))
+        # NOTE(ndipanov): Null out the device names so that blockinfo code
+        #                 will assign them
+        index = 0
+        if root_device_name:
+            if root_device_name != '/dev/c1d0':
+                LOG.info(
+                    "Ignoring supplied device name: %(device_name)s. "
+                    "Solaris can't honour user-supplied dev names",
+                    {'device_name': root_device_name}, instance=instance)
+                instance['root_device_name'] = '/dev/c1d0'
+            index = 1
+        for bdm in block_device_mapping:
+            if bdm.device_name is not None:
+                LOG.info(
+                    "Ignoring supplied device name: %(device_name)s. "
+                    "Solaris can't honour user-supplied dev names",
+                    {'device_name': bdm.device_name}, instance=instance)
+            bdm.device_name = '/dev/c1d%d' % index
+            index = index + 1
 
     def get_device_name_for_instance(self, instance,
                                      bdms, block_device_obj):
