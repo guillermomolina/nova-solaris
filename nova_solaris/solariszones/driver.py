@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2021, Guillermo Adrian Molina.
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
@@ -23,7 +21,6 @@ Driver for Solaris Zones (nee Containers):
 """
 import base64
 import glob
-import itertools
 import os
 import platform
 import shutil
@@ -31,6 +28,7 @@ import tempfile
 import uuid
 
 from collections import defaultdict
+from nova import block_device
 import rad.bindings.com.oracle.solaris.rad.archivemgr_1 as archivemgr
 import rad.bindings.com.oracle.solaris.rad.kstat_2 as kstat
 import rad.bindings.com.oracle.solaris.rad.zonemgr_1 as zonemgr
@@ -72,7 +70,6 @@ from nova.image import glance
 from nova.network import neutron as neutron_api
 from nova.network import model as network_model
 from nova import objects
-from nova.objects import flavor as flavor_obj
 from nova.objects import migrate_data as migrate_data_obj
 from nova import utils
 from nova.virt import configdrive
@@ -82,7 +79,9 @@ from nova.virt import hardware
 from nova.virt import images
 
 from nova_solaris.solariszones import sysconfig
+from nova_solaris.solariszones import utils
 from nova_solaris.solariszones.config import CONF
+from nova_solaris.solariszones.zone_config import ZoneConfig
 from nova_solaris.solariszones.volume_api import SolarisVolumeAPI
 
 LOG = logging.getLogger(__name__)
@@ -154,202 +153,10 @@ KSTAT_TYPE = {
 }
 
 
-def lookup_resource(zone, resource):
-    """Lookup specified resource from specified Solaris Zone."""
-    try:
-        val = zone.getResources(zonemgr.Resource(resource))
-    except rad.client.ObjectError:
-        return None
-    except Exception:
-        raise
-    return val[0] if val else None
-
-
-def lookup_resource_property(zone, resource, prop, filter=None):
-    """Lookup specified property from specified Solaris Zone resource."""
-    try:
-        val = zone.getResourceProperties(zonemgr.Resource(resource, filter),
-                                         [prop])
-    except rad.client.ObjectError:
-        return None
-    except Exception:
-        raise
-    return val[0].value if val else None
-
-
-def lookup_resource_property_value(zone, resource, prop, value):
-    """Lookup specified property with value from specified Solaris Zone
-    resource. Returns resource object if matching value is found, else None
-    """
-    try:
-        resources = zone.getResources(zonemgr.Resource(resource))
-        for resource in resources:
-            for propertee in resource.properties:
-                if propertee.name == prop and propertee.value == value:
-                    return resource
-        else:
-            return None
-    except rad.client.ObjectError:
-        return None
-    except Exception:
-        raise
-
-
-def zonemgr_strerror(ex):
-    """Format the payload from a zonemgr(3RAD) rad.client.ObjectError
-    exception into a sensible error string that can be logged. Newlines
-    are converted to a colon-space string to create a single line.
-
-    If the exception was something other than rad.client.ObjectError,
-    just return it as a string.
-    """
-    if not isinstance(ex, rad.client.ObjectError):
-        return str(ex)
-    payload = ex.get_payload()
-    if payload.code == zonemgr.ErrorCode.NONE:
-        return str(ex)
-    error = [str(payload.code)]
-    if payload.str is not None and payload.str != '':
-        error.append(payload.str)
-    if payload.stderr is not None and payload.stderr != '':
-        stderr = payload.stderr.rstrip()
-        error.append(stderr.replace('\n', ': '))
-    result = ': '.join(error)
-    return result
-
 
 class MemoryAlignmentIncorrect(exception.FlavorMemoryTooSmall):
     msg_fmt = _("Requested flavor, %(flavor)s, memory size %(memsize)s does "
                 "not align on %(align)s boundary.")
-
-
-class ZoneConfig(object):
-    """ZoneConfig - context manager for access zone configurations.
-    Automatically opens the configuration for a zone and commits any changes
-    before exiting
-    """
-
-    def __init__(self, zone):
-        """zone is a zonemgr object representing either a kernel zone or
-        non-global zone.
-        """
-        self.zone = zone
-        self.editing = False
-
-    def __enter__(self):
-        """enables the editing of the zone."""
-        try:
-            self.zone.editConfig()
-            self.editing = True
-            return self
-        except Exception as ex:
-            reason = zonemgr_strerror(ex)
-            LOG.exception(_("Unable to initialize editing of instance '%s' "
-                            "via zonemgr(3RAD): %s")
-                          % (self.zone.name, reason))
-            raise
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """looks for any kind of exception before exiting.  If one is found,
-        cancel any configuration changes and reraise the exception.  If not,
-        commit the new configuration.
-        """
-        if exc_type is not None and self.editing:
-            # We received some kind of exception.  Cancel the config and raise.
-            self.zone.cancelConfig()
-            raise
-        else:
-            # commit the config
-            try:
-                self.zone.commitConfig()
-            except Exception as ex:
-                reason = zonemgr_strerror(ex)
-                LOG.exception(_("Unable to commit the new configuration for "
-                                "instance '%s' via zonemgr(3RAD): %s")
-                              % (self.zone.name, reason))
-
-                # Last ditch effort to cleanup.
-                self.zone.cancelConfig()
-                raise
-
-    def setprop(self, resource, prop, value):
-        """sets a property for an existing resource OR creates a new resource
-        with the given property(s).
-        """
-        current = lookup_resource_property(self.zone, resource, prop)
-        if current is not None and current == value:
-            # the value is already set
-            return
-
-        try:
-            if current is None:
-                self.zone.addResource(zonemgr.Resource(
-                    resource, [zonemgr.Property(prop, value)]))
-            else:
-                self.zone.setResourceProperties(
-                    zonemgr.Resource(resource),
-                    [zonemgr.Property(prop, value)])
-        except Exception as ex:
-            reason = zonemgr_strerror(ex)
-            LOG.exception(_("Unable to set '%s' property on '%s' resource for "
-                            "instance '%s' via zonemgr(3RAD): %s")
-                          % (prop, resource, self.zone.name, reason))
-            raise
-
-    def addresource(self, resource, props=None, ignore_exists=False):
-        """creates a new resource with an optional property list, or set the
-        property if the resource exists and ignore_exists is true.
-
-        :param ignore_exists: If the resource exists, set the property for the
-            resource.
-        """
-        if props is None:
-            props = []
-
-        try:
-            self.zone.addResource(zonemgr.Resource(resource, props))
-        except Exception as ex:
-            if isinstance(ex, rad.client.ObjectError):
-                code = ex.get_payload().code
-                if (ignore_exists and
-                        code == zonemgr.ErrorCode.RESOURCE_ALREADY_EXISTS):
-                    self.zone.setResourceProperties(
-                        zonemgr.Resource(resource, None), props)
-                    return
-            reason = zonemgr_strerror(ex)
-            LOG.exception(_("Unable to create new resource '%s' for instance "
-                            "'%s' via zonemgr(3RAD): %s")
-                          % (resource, self.zone.name, reason))
-            raise
-
-    def removeresources(self, resource, props=None):
-        """removes resources whose properties include the optional property
-        list specified in props.
-        """
-        if props is None:
-            props = []
-
-        try:
-            self.zone.removeResources(zonemgr.Resource(resource, props))
-        except Exception as ex:
-            reason = zonemgr_strerror(ex)
-            LOG.exception(_("Unable to remove resource '%s' for instance '%s' "
-                            "via zonemgr(3RAD): %s")
-                          % (resource, self.zone.name, reason))
-            raise
-
-    def clear_resource_props(self, resource, props):
-        """Clear property values of a given resource
-        """
-        try:
-            self.zone.clearResourceProperties(zonemgr.Resource(resource, None),
-                                              props)
-        except rad.client.ObjectError as ex:
-            reason = zonemgr_strerror(ex)
-            LOG.exception(_("Unable to clear '%s' property on '%s' resource "
-                            "for instance '%s' via zonemgr(3RAD): %s")
-                          % (props, resource, self.zone.name, reason))
-            raise
 
 
 class SolarisZonesDriver(driver.ComputeDriver):
@@ -646,7 +453,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         else:
             mem_resource = 'physical'
 
-        max_mem = lookup_resource_property(zone, 'capped-memory', mem_resource)
+        max_mem = utils.lookup_resource_property(zone, 'capped-memory', mem_resource)
         if max_mem is not None:
             return strutils.string_to_bytes("%sB" % max_mem) / units.Ki
 
@@ -675,7 +482,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         """
         # If a 'virtual-cpu' resource exists, use the minimum number of
         # CPUs defined there.
-        ncpus = lookup_resource_property(zone, 'virtual-cpu', 'ncpus')
+        ncpus = utils.lookup_resource_property(zone, 'virtual-cpu', 'ncpus')
         if ncpus is not None:
             min = ncpus.split('-', 1)[0]
             if min.isdigit():
@@ -683,7 +490,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         # Otherwise if a 'dedicated-cpu' resource exists, use the maximum
         # number of CPUs defined there.
-        ncpus = lookup_resource_property(zone, 'dedicated-cpu', 'ncpus')
+        ncpus = utils.lookup_resource_property(zone, 'dedicated-cpu', 'ncpus')
         if ncpus is not None:
             max = ncpus.split('-', 1)[-1]
             if max.isdigit():
@@ -952,7 +759,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         if zone is None:
             return None
 
-        hostid = lookup_resource_property(zone, 'global', 'hostid')
+        hostid = utils.lookup_resource_property(zone, 'global', 'hostid')
         if hostid:
             instance.system_metadata['hostid'] = hostid
 
@@ -1426,7 +1233,8 @@ class SolarisZonesDriver(driver.ComputeDriver):
         self._volume_api.attach(context, volume_id, instance_uuid, mountpoint)
         return connection_info
 
-    def _set_boot_device(self, name, connection_info, brand):
+    def _set_boot_device(self, name, connection_info, brand, mountpoint=None):
+        LOG.debug("_set_boot_device")
         """Set the boot device specified by connection_info"""
         zone = self._get_zone_by_name(name)
         if zone is None:
@@ -1437,9 +1245,13 @@ class SolarisZonesDriver(driver.ComputeDriver):
         with ZoneConfig(zone) as zc:
             # ZOSS device configuration is different for the solaris-kz brand
             if brand == ZONE_BRAND_SOLARIS_KZ:
+                if mountpoint is None:
+                    raise NotImplementedError('must set mountpoint')
+                id = str(self._get_device_index(mountpoint))
+
                 zc.zone.setResourceProperties(
                     zonemgr.Resource("device",
-                                     [zonemgr.Property("bootpri", "0")]),
+                                     [zonemgr.Property("bootpri", "0"), zonemgr.Property("id", id)]),
                     [zonemgr.Property("storage", suri)])
             else:
                 zc.addresource(ROOTZPOOL_RESOURCE,
@@ -1461,8 +1273,10 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         with ZoneConfig(zone) as zc:
             storagepath = "file://root:root@" + cd_path
-            zc.addresource("device", [zonemgr.Property("storage", storagepath),
-                                      zonemgr.Property("id", "1")])
+            zc.addresource("device", [zonemgr.Property(
+                "storage", storagepath)
+                # , zonemgr.Property("id", "1")
+            ])
 
         fp = os.path.join(sc_dir, "config_drive.xml")
         tree = sysconfig.create_config_drive()
@@ -1589,10 +1403,10 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
             prop_filter = [zonemgr.Property('mac-address', vif['address'])]
             if brand == ZONE_BRAND_SOLARIS:
-                anetname = lookup_resource_property(zc.zone, 'anet',
+                anetname = utils.lookup_resource_property(zc.zone, 'anet',
                                                     'linkname', prop_filter)
             else:
-                anetid = lookup_resource_property(zc.zone, 'anet', 'id',
+                anetid = utils.lookup_resource_property(zc.zone, 'anet', 'id',
                                                   prop_filter)
                 anetname = 'net%s' % anetid
         return anetname
@@ -1747,7 +1561,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             fp = os.path.join(sc_dir, 'hostname.xml')
             sysconfig.create_sc_profile(fp, sysconfig.create_hostname(name))
 
-    def _create_config(self, context, instance, network_info, connection_info,
+    def _create_config(self, context, instance, network_info, block_device_info,
                        sc_dir, admin_password=None):
         """Create a new Solaris Zone configuration."""
         name = instance['name']
@@ -1801,8 +1615,17 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 with ZoneConfig(zone) as zc:
                     zc.setprop('global', 'hostid', hostid)
 
-            if connection_info is not None:
-                self._set_boot_device(name, connection_info, brand)
+            root_device_name = block_device_info.get('root_device_name')
+            for entry in block_device_info.get('block_device_mapping'):
+                connection_info = entry.get('connection_info')
+                if connection_info is not None:
+                    if entry['mount_device'] == root_device_name:
+                        self._set_boot_device(
+                            name, connection_info, brand, root_device_name)
+                    else:
+                        self.attach_volume(
+                            context, connection_info, instance, entry['mount_device'])
+
             self._set_num_cpu(name, instance['vcpus'], brand)
             self._set_memory_cap(name, instance['memory_mb'], brand)
             self._set_network(context, name, instance, network_info, brand,
@@ -1810,7 +1633,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             if configdrive.required_by(instance):
                 self._set_configdrive(name, instance, sc_dir)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to create configuration for instance '%s' "
                             "via zonemgr(3RAD): %s") % (name, reason))
             raise
@@ -2016,7 +1839,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
                       (name, instance['display_name']))
             zone.install(options=options)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to install root file system for instance "
                             "'%s' via zonemgr(3RAD): %s") % (name, reason))
             raise
@@ -2046,7 +1869,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
                       (name, instance['display_name']))
             zone.attach(options=options)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to attach root file system for instance "
                             "'%s' via zonemgr(3RAD): %s") % (name, reason))
             raise
@@ -2073,7 +1896,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             persistent = 'False'
 
             # Get any bootargs already set in the zone
-            cur_bootargs = lookup_resource_property(zone, 'global', 'bootargs')
+            cur_bootargs = utils.lookup_resource_property(zone, 'global', 'bootargs')
 
             # Get any bootargs set in the instance metadata by the user
             meta_bootargs = instance.metadata.get('bootargs')
@@ -2092,7 +1915,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             zone.boot(bootargs)
             self._plug_vifs(instance, network_info)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to power on instance '%s' via "
                             "zonemgr(3RAD): %s") % (name, reason))
             raise exception.InstancePowerOnFailure(reason=reason)
@@ -2124,7 +1947,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         try:
             zone.uninstall(['-F'])
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to uninstall root file system for "
                             "instance '%s' via zonemgr(3RAD): %s")
                           % (name, reason))
@@ -2139,7 +1962,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         try:
             self.zone_manager.delete(name)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to delete configuration for instance '%s' "
                             "via zonemgr(3RAD): %s") % (name, reason))
             raise
@@ -2238,29 +2061,36 @@ class SolarisZonesDriver(driver.ComputeDriver):
         name = instance.name
         brand = self._validate_flavor(instance)
 
-        boot_info = {}
+        install_image_path = None
 
         if instance.image_ref:
-            boot_info['image_path'] = self._fetch_image(context, instance)
+            image_path = self._fetch_image(context, instance)
             if image_meta.container_format == 'ovf':
                 self._validate_image(
-                    context, boot_info['image_path'], instance)
-                boot_info['install'] = True
-                raise NotImplementedError()
-                # root_disk_connection_info =
+                    context, image_path, instance)
+                install_image_path = image_path
             else:
                 if brand != ZONE_BRAND_SOLARIS_KZ:
                     reason = 'Raw devices are compatible only with kernel zones'
                     raise exception.ImageUnacceptable(image_id=instance['image_ref'],
                                                       reason=reason)
-                boot_info['attach'] = True
-                # TODO: copy file to local instance storage
-                volume_path = boot_info['image_path']
-                connection_info = {
-                    'driver_volume_type': 'file',
-                    'volume_path': volume_path,
+                instance_dir = utils.create_instance_dir(instance)
+                volume_path = instance_dir + '/disk'
+                try:
+                    utils.copy_file(image_path, volume_path)
+                except:
+                    reason = 'Could not copy image %s to instance path %s' % (image_path, volume_path)
+                    raise exception.ImageUnacceptable(image_id=instance['image_ref'],
+                                                      reason=reason)
+                mapping = {
+                    'mount_device': block_device_info.get('root_device_name'),
+                    'connection_info': {
+                        'driver_volume_type': 'file',
+                        'volume_path': volume_path,
+                    }
                 }
-                boot_info['connection_info'] = connection_info
+                block_device_info.setdefault(
+                    'block_device_mapping', []).append(mapping)
 
         # create a new directory for SC profiles
         sc_dir = tempfile.mkdtemp(prefix="nova-sysconfig-",
@@ -2282,26 +2112,21 @@ class SolarisZonesDriver(driver.ComputeDriver):
 
         try:
             self._create_config(context, instance, network_info,
-                                boot_info.get('connection_info'), sc_dir, admin_password)
+                                block_device_info, sc_dir, admin_password)
 
-            if boot_info.get('install'):
-                self._install(instance, boot_info['image_path'], sc_dir)
-
-            if boot_info.get('attach'):
+            if install_image_path:
+                self._install(instance, install_image_path, sc_dir)
+            else:
                 self._attach(instance)
 
-            for entry in block_device_info.get('block_device_mapping'):
-                if entry['connection_info'] is not None:
-                    self.attach_volume(context, entry['connection_info'],
-                                       instance, entry['mount_device'])
-
-            self._power_on(instance, network_info)
+            if power_on:
+                self._power_on(instance, network_info)
             if configdrive.required_by(instance):
                 unset = self._waitfor_copydone(name)
                 if unset:
                     self._unset_configdrive(name, instance)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to spawn instance '%s' via zonemgr(3RAD): "
                             "'%s'") % (name, reason))
             # At least attempt to uninstall the instance, depending on where
@@ -2310,13 +2135,13 @@ class SolarisZonesDriver(driver.ComputeDriver):
             try:
                 self._uninstall(instance)
             except Exception as ex:
-                reason = zonemgr_strerror(ex)
+                reason = utils.zonemgr_strerror(ex)
                 LOG.debug(_("Unable to uninstall instance '%s' via "
                             "zonemgr(3RAD): %s") % (name, reason))
             try:
                 self._delete_config(instance)
             except Exception as ex:
-                reason = zonemgr_strerror(ex)
+                reason = utils.zonemgr_strerror(ex)
                 LOG.debug(_("Unable to unconfigure instance '%s' via "
                             "zonemgr(3RAD): %s") % (name, reason))
 
@@ -2425,7 +2250,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 if unset:
                     self._unset_configdrive(name, instance)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to spawn instance '%s' via zonemgr(3RAD): "
                             "'%s'") % (name, reason))
             # At least attempt to uninstall the instance, depending on where
@@ -2434,13 +2259,13 @@ class SolarisZonesDriver(driver.ComputeDriver):
             try:
                 self._uninstall(instance)
             except Exception as ex:
-                reason = zonemgr_strerror(ex)
+                reason = utils.zonemgr_strerror(ex)
                 LOG.debug(_("Unable to uninstall instance '%s' via "
                             "zonemgr(3RAD): %s") % (name, reason))
             try:
                 self._delete_config(instance)
             except Exception as ex:
-                reason = zonemgr_strerror(ex)
+                reason = utils.zonemgr_strerror(ex)
                 LOG.debug(_("Unable to unconfigure instance '%s' via "
                             "zonemgr(3RAD): %s") % (name, reason))
 
@@ -2491,7 +2316,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 # 'HARD'
                 zone.halt()
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             # A shutdown state could still be reached if the error was
             # informational and ignorable.
             if self._get_state(zone) == power_state.SHUTDOWN:
@@ -2594,9 +2419,10 @@ class SolarisZonesDriver(driver.ComputeDriver):
                     os.remove(cd_path)
                 except OSError:
                     pass
+            utils.delete_instance_dir(instance)
 
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.warning(_("Unable to destroy instance '%s' via zonemgr(3RAD): "
                           "%s") % (name, reason))
 
@@ -2683,7 +2509,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             persistent = 'False'
 
             # Get any bootargs already set in the zone
-            cur_bootargs = lookup_resource_property(zone, 'global', 'bootargs')
+            cur_bootargs = utils.lookup_resource_property(zone, 'global', 'bootargs')
 
             # Get any bootargs set in the instance metadata by the user
             meta_bootargs = instance.metadata.get('bootargs')
@@ -2707,7 +2533,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
                 zone.reboot(bootargs)
             self._plug_vifs(instance, network_info)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to reboot instance '%s' via "
                             "zonemgr(3RAD): %s") % (name, reason))
             raise exception.InstanceRebootFailure(reason=reason)
@@ -3025,22 +2851,30 @@ class SolarisZonesDriver(driver.ComputeDriver):
             raise NotImplementedError(reason)
 
         suri = self._suri_from_volume_info(connection_info)
+        id = str(self._get_device_index(mountpoint))
 
-        resource_scope = [zonemgr.Property("storage", suri)]
-        if connection_info.get('serial') is not None:
-            volume = self._volume_api.get(context, connection_info['serial'])
-            if volume['bootable']:
-                resource_scope.append(zonemgr.Property("bootpri", "1"))
+        resource_scope = [
+            zonemgr.Property("storage", suri),
+            zonemgr.Property("id", str(id))
+        ]
 
-        with ZoneConfig(zone) as zc:
-            zc.addresource("device", resource_scope)
+        # if connection_info.get('serial') is not None:
+        #     volume = self._volume_api.get(context, connection_info['serial'])
+        #     if volume['bootable']:
+        #         resource_scope.append(zonemgr.Property("bootpri", "1"))
+
+        try:
+            with ZoneConfig(zone) as zc:
+                zc.addresource("device", resource_scope)
+        except:
+            LOG.error("Could not attach %s at %s" % (suri, id))
 
         # apply the configuration to the running zone
         if zone.state == ZONE_STATE_RUNNING:
             try:
                 zone.apply()
             except Exception as ex:
-                reason = zonemgr_strerror(ex)
+                reason = utils.zonemgr_strerror(ex)
                 LOG.exception(_("Unable to attach '%s' to instance '%s' via "
                                 "zonemgr(3RAD): %s") % (suri, name, reason))
                 with ZoneConfig(zone) as zc:
@@ -3067,7 +2901,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         suri = self._suri_from_volume_info(connection_info)
 
         # Check if the specific property value exists before attempting removal
-        resource = lookup_resource_property_value(zone, "device", "storage",
+        resource = utils.lookup_resource_property_value(zone, "device", "storage",
                                                   suri)
         if not resource:
             LOG.warning(_("Storage resource '%s' is not attached to instance "
@@ -3155,7 +2989,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             try:
                 zone.apply()
             except Exception as ex:
-                reason = zonemgr_strerror(ex)
+                reason = utils.zonemgr_strerror(ex)
                 msg = (_("Unable to attach interface to instance '%s' via "
                          "zonemgr(3RAD): %s") % (name, reason))
                 with ZoneConfig(zone) as zc:
@@ -3167,7 +3001,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             anet = ''.join([name, '/', anetname])
             self._vif_driver.plug(instance, vif)
 
-    def detach_interface(self, instance, vif):
+    def detach_interface(self, context, instance, vif):
         LOG.debug("detach_interface")
         """Use hotunplug to remove a network interface from a running instance.
 
@@ -3188,7 +3022,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             raise exception.InstanceNotFound(instance_id=name)
 
         # Check if the specific property value exists before attempting removal
-        resource = lookup_resource_property_value(zone, 'anet',
+        resource = utils.lookup_resource_property_value(zone, 'anet',
                                                   'mac-address',
                                                   vif['address'])
         if not resource:
@@ -3816,10 +3650,10 @@ class SolarisZonesDriver(driver.ComputeDriver):
         try:
             new_path = os.path.join(CONF.solariszones.zones_suspend_path,
                                     '%{zonename}')
-            if not lookup_resource(zone, 'suspend'):
+            if not utils.lookup_resource(zone, 'suspend'):
                 # add suspend if not configured
                 self._set_suspend(instance)
-            elif lookup_resource_property(zone, 'suspend', 'path') != new_path:
+            elif utils.lookup_resource_property(zone, 'suspend', 'path') != new_path:
                 # replace the old suspend resource with the new one
                 with ZoneConfig(zone) as zc:
                     zc.removeresources('suspend')
@@ -3828,7 +3662,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             zone.suspend()
             self._unplug_vifs(instance)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to suspend instance '%s' via "
                             "zonemgr(3RAD): %s") % (name, reason))
             raise exception.InstanceSuspendFailure(reason=reason)
@@ -3873,7 +3707,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             zone.boot()
             self._plug_vifs(instance, network_info)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to resume instance '%s' via "
                             "zonemgr(3RAD): %s") % (name, reason))
             raise exception.InstanceResumeFailure(reason=reason)
@@ -4242,7 +4076,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
             self._live_migration(name, dest, dry_run=False)
         except Exception as ex:
             with excutils.save_and_reraise_exception():
-                reason = zonemgr_strerror(ex)
+                reason = utils.zonemgr_strerror(ex)
                 LOG.exception(_("Unable to live migrate instance '%s' to host "
                                 "'%s' via zonemgr(3RAD): %s")
                               % (name, dest, reason))
@@ -4318,7 +4152,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         try:
             self._delete_config(instance)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             LOG.exception(_("Unable to delete configuration for instance '%s' "
                             "via zonemgr(3RAD): %s") % (name, reason))
             raise
@@ -4473,7 +4307,7 @@ class SolarisZonesDriver(driver.ComputeDriver):
         try:
             self._live_migration(name, dest, dry_run=True)
         except Exception as ex:
-            reason = zonemgr_strerror(ex)
+            reason = utils.zonemgr_strerror(ex)
             raise exception.MigrationPreCheckError(reason=reason)
         return dest_check_data
 
@@ -5146,30 +4980,20 @@ class SolarisZonesDriver(driver.ComputeDriver):
         LOG.debug("default_root_device_name")
         raise NotImplementedError()
 
-    def default_device_names_for_instance(self, instance, root_device_name,
-                                          *block_device_lists):
-        LOG.debug("default_device_names_for_instance")
-        """Default the missing device names in the block device mapping."""
-        block_device_mapping = list(itertools.chain(*block_device_lists))
-        # NOTE(ndipanov): Null out the device names so that blockinfo code
-        #                 will assign them
+    def _get_device_index(self, dev_name):
+        def val(c):
+            return ord(c) - ord('a')
+
+        letters = block_device.get_device_letter(dev_name)
+
+        base = val('z') + 1
         index = 0
-        if root_device_name:
-            if root_device_name != '/dev/c1d0':
-                LOG.info(
-                    "Ignoring supplied device name: %(device_name)s. "
-                    "Solaris can't honour user-supplied dev names",
-                    {'device_name': root_device_name}, instance=instance)
-                instance['root_device_name'] = '/dev/c1d0'
-            index = 1
-        for bdm in block_device_mapping:
-            if bdm.device_name is not None:
-                LOG.info(
-                    "Ignoring supplied device name: %(device_name)s. "
-                    "Solaris can't honour user-supplied dev names",
-                    {'device_name': bdm.device_name}, instance=instance)
-            bdm.device_name = '/dev/c1d%d' % index
-            index = index + 1
+        for i, l in enumerate(reversed(letters)):
+            if i == 0:
+                index = val(l)
+            else:
+                index = index + (base**i) * (val(l) + 1)
+        return index
 
     def get_device_name_for_instance(self, instance,
                                      bdms, block_device_obj):
